@@ -59,6 +59,14 @@ impl CompressedPosition {
         let mut pos = Position::empty();
         pos.set_castling_rights(CastlingRights::NONE);
 
+        // Castling rooks are marked with nibbles 13 (white) / 14 (black), but the
+        // side (king-/queen-side) is NOT stored: it is inferred from the rook's
+        // file relative to its king. That needs both kings placed first, so we
+        // just collect the marked rook squares here and resolve rights after the
+        // pass (see resolve_castling). DFRC/Chess960-general: no a/h assumption.
+        let mut white_castle_rooks: u64 = 0;
+        let mut black_castle_rooks: u64 = 0;
+
         let mut decompress_piece = |sq: Square, nibble: u8| {
             match nibble {
                 0..=11 => {
@@ -77,21 +85,11 @@ impl CompressedPosition {
                 }
                 13 => {
                     pos.place(Piece::WHITE_ROOK, sq);
-                    if sq == Square::A1 {
-                        pos.add_castling_rights(CastlingRights::WHITE_QUEEN_SIDE);
-                    } else {
-                        // sq == Square::H1
-                        pos.add_castling_rights(CastlingRights::WHITE_KING_SIDE);
-                    }
+                    white_castle_rooks |= 1u64 << sq.index();
                 }
                 14 => {
                     pos.place(Piece::BLACK_ROOK, sq);
-                    if sq == Square::A8 {
-                        pos.add_castling_rights(CastlingRights::BLACK_QUEEN_SIDE);
-                    } else {
-                        // sq == Square::H8
-                        pos.add_castling_rights(CastlingRights::BLACK_KING_SIDE);
-                    }
+                    black_castle_rooks |= 1u64 << sq.index();
                 }
                 15 => {
                     pos.place(Piece::BLACK_KING, sq);
@@ -116,6 +114,9 @@ impl CompressedPosition {
             }
         }
 
+        resolve_castling(&mut pos, Color::White, white_castle_rooks);
+        resolve_castling(&mut pos, Color::Black, black_castle_rooks);
+
         pos
     }
 
@@ -124,6 +125,10 @@ impl CompressedPosition {
             occupied: pos.occupied(),
             packed_state: [0u8; 16],
         };
+
+        let rights = pos.castling_rights();
+        let white_king = pos.king_sq(Color::White).index();
+        let black_king = pos.king_sq(Color::Black).index();
 
         let pack_piece = |sq: Square| -> u8 {
             let piece = pos.piece_at(sq);
@@ -144,30 +149,28 @@ impl CompressedPosition {
                 }
             }
 
-            // Special case: rooks with castling rights
-            if piece == Piece::WHITE_ROOK
-                && ((sq == Square::A1
-                    && pos
-                        .castling_rights()
-                        .contains(CastlingRights::WHITE_QUEEN_SIDE))
-                    || (sq == Square::H1
-                        && pos
-                            .castling_rights()
-                            .contains(CastlingRights::WHITE_KING_SIDE)))
-            {
-                return 13;
+            // Special case: a castling rook (DFRC/Chess960-general). The rook is a
+            // castling rook if it sits on its king's rank and the matching right is
+            // held; queen-side = left of the king, king-side = right of it. The
+            // side is inferred from the king's file, NOT hard-coded to a1/h1, so
+            // rooks on any file are handled correctly.
+            if piece == Piece::WHITE_ROOK && (sq.index() >> 3) == (white_king >> 3) {
+                if (sq.index() & 7) < (white_king & 7) {
+                    if rights.contains(CastlingRights::WHITE_QUEEN_SIDE) {
+                        return 13;
+                    }
+                } else if rights.contains(CastlingRights::WHITE_KING_SIDE) {
+                    return 13;
+                }
             }
-            if piece == Piece::BLACK_ROOK
-                && ((sq == Square::A8
-                    && pos
-                        .castling_rights()
-                        .contains(CastlingRights::BLACK_QUEEN_SIDE))
-                    || (sq == Square::H8
-                        && pos
-                            .castling_rights()
-                            .contains(CastlingRights::BLACK_KING_SIDE)))
-            {
-                return 14;
+            if piece == Piece::BLACK_ROOK && (sq.index() >> 3) == (black_king >> 3) {
+                if (sq.index() & 7) < (black_king & 7) {
+                    if rights.contains(CastlingRights::BLACK_QUEEN_SIDE) {
+                        return 14;
+                    }
+                } else if rights.contains(CastlingRights::BLACK_KING_SIDE) {
+                    return 14;
+                }
             }
 
             // Special case: black king when black to move
@@ -190,6 +193,39 @@ impl CompressedPosition {
         }
 
         compressed
+    }
+}
+
+/// Set `color`'s castling rights from a bitboard of its marked castling-rook
+/// squares. The stored format does not record king-/queen-side, so we infer it
+/// from each rook's file relative to the king: a rook left of the king is the
+/// queen-side rook, one to the right is the king-side rook. This is
+/// DFRC/Chess960-general and makes no assumption about a/h-file rooks.
+fn resolve_castling(pos: &mut Position, color: Color, mut rooks: u64) {
+    if rooks == 0 {
+        return;
+    }
+
+    let king_file = pos.king_sq(color).index() & 7;
+    let (queen_side, king_side) = match color {
+        Color::White => (
+            CastlingRights::WHITE_QUEEN_SIDE,
+            CastlingRights::WHITE_KING_SIDE,
+        ),
+        Color::Black => (
+            CastlingRights::BLACK_QUEEN_SIDE,
+            CastlingRights::BLACK_KING_SIDE,
+        ),
+    };
+
+    while rooks != 0 {
+        let file = rooks.trailing_zeros() & 7;
+        rooks &= rooks - 1;
+        if file < king_file {
+            pos.add_castling_rights(queen_side);
+        } else {
+            pos.add_castling_rights(king_side);
+        }
     }
 }
 
@@ -289,5 +325,38 @@ mod tests {
                 .unwrap();
 
         assert_eq!(position_without_fmt, decompressed_pos);
+    }
+
+    #[test]
+    fn test_compress_decompress_dfrc_castling() {
+        // Chess960: kings on the d-file with castling rooks on the b- and f-files
+        // (NOT a/h). The old a1/h1-hard-coded encoding silently dropped these
+        // rights; the king-file inference must round-trip all of KQkq.
+        let pos = Position::from_fen("1r1k1r2/8/8/8/8/8/8/1R1K1R2 w KQkq - 0 1").unwrap();
+        assert_eq!(pos.castling_rights(), CastlingRights::ALL);
+
+        let compressed = CompressedPosition::compress(&pos);
+        let decompressed = compressed.decompress();
+
+        assert_eq!(decompressed.castling_rights(), CastlingRights::ALL);
+        assert_eq!(pos, decompressed);
+    }
+
+    #[test]
+    fn test_compress_decompress_dfrc_partial_rights() {
+        // Only one side retains a right, and the rook is off the a/h files: white
+        // keeps queen-side (rook c1, king e1), black keeps king-side (rook g8,
+        // king b8). Must round-trip exactly, dropping nothing and adding nothing.
+        // (CompressedPosition does not store the move clocks, so use 0 1.)
+        let pos = Position::from_fen("1k4r1/8/8/8/8/8/8/2R1K3 w Qk - 0 1").unwrap();
+        let expected = CastlingRights::WHITE_QUEEN_SIDE;
+        assert!(pos.castling_rights().contains(expected));
+        assert!(pos
+            .castling_rights()
+            .contains(CastlingRights::BLACK_KING_SIDE));
+
+        let decompressed = CompressedPosition::compress(&pos).decompress();
+        assert_eq!(pos, decompressed);
+        assert_eq!(pos.castling_rights(), decompressed.castling_rights());
     }
 }
