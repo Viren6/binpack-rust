@@ -24,6 +24,7 @@ pub struct PackedMoveScoreList {
     pub num_plies: u16,
     writer: BitWriter,
     last_score: i16,
+    last_draw: i16,
 }
 
 impl PackedMoveScoreList {
@@ -32,6 +33,7 @@ impl PackedMoveScoreList {
             num_plies: 0,
             writer: BitWriter::new(),
             last_score: 0,
+            last_draw: 0,
         }
     }
 
@@ -39,13 +41,15 @@ impl PackedMoveScoreList {
         self.num_plies = 0;
         self.writer.clear();
         self.last_score = -e.score;
+        // Draw is side-symmetric: no sign flip (see add_move_score).
+        self.last_draw = e.draw_score;
     }
 
     pub fn movetext(&self) -> &[u8] {
         self.writer.movetext()
     }
 
-    pub fn add_move_score(&mut self, pos: &Position, mv: Move, score: i16) {
+    pub fn add_move_score(&mut self, pos: &Position, mv: Move, score: i16, draw_score: i16) {
         let side_to_move = pos.side_to_move();
         let piece_id =
             (pos.pieces_bb(side_to_move) & Bitboard::from_before(mv.from().index())).count() as u8;
@@ -66,6 +70,17 @@ impl PackedMoveScoreList {
             .add_bits_vle16(score_delta, SCORE_VLE_BLOCK_SIZE);
 
         self.last_score = -score;
+
+        // Draw channel: same zigzag + VLE delta as the score, but the draw
+        // probability is identical from both sides, so we do NOT negate
+        // last_draw between plies. A stable draw value therefore encodes as a
+        // ~0 delta (cheap), just like a stable score does via the sign flip.
+        let draw_delta: u16 = signed_to_unsigned(draw_score.wrapping_sub(self.last_draw));
+
+        self.writer
+            .add_bits_vle16(draw_delta, SCORE_VLE_BLOCK_SIZE);
+
+        self.last_draw = draw_score;
 
         self.num_plies += 1;
     }

@@ -36,6 +36,7 @@ fn main() {
             score: -201,
             ply: 68,
             result: 0,
+            draw_score: 0,
         },
         TrainingDataEntry {
             pos: Position::from_fen("1q5b/1r5k/4p2p/1b2P1pN/2Pp4/6PP/1n4B1/1Q2B1K1 b - - 0 35")
@@ -49,6 +50,7 @@ fn main() {
             score: 254,
             ply: 69,
             result: 0,
+            draw_score: 0,
         },
         TrainingDataEntry {
             pos: Position::from_fen("1q5b/1r5k/4p2p/1b2P1pN/2P5/3p2PP/1n4B1/1Q2B1K1 w - - 0 36")
@@ -62,6 +64,7 @@ fn main() {
             score: -220,
             ply: 70,
             result: 0,
+            draw_score: 0,
         },
     ];
 

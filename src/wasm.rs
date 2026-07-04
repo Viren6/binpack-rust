@@ -43,6 +43,7 @@ pub fn parse_binpack_chunk(
             )?;
             set_property(&js_entry, "uci", JsValue::from_str(&entry.mv.as_uci()))?;
             set_property(&js_entry, "score", JsValue::from_f64(entry.score as f64))?;
+            set_property(&js_entry, "draw", JsValue::from_f64(entry.draw_score as f64))?;
             set_property(&js_entry, "ply", JsValue::from_f64(entry.ply as f64))?;
             set_property(&js_entry, "result", JsValue::from_f64(entry.result as f64))?;
             set_property(&js_entry, "continuation", JsValue::from_bool(continuation))?;

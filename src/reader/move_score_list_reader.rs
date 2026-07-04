@@ -20,6 +20,7 @@ use super::bitreader::BitReader;
 pub struct PackedMoveScoreListReader {
     reader: BitReader,
     last_score: i16,
+    last_draw: i16,
     num_plies: u16,
     num_read_plies: u16,
     entry: TrainingDataEntry,
@@ -33,6 +34,8 @@ impl PackedMoveScoreListReader {
             entry,
             num_read_plies: 0,
             last_score: -entry.score,
+            // Draw is side-symmetric: no sign flip (mirrors the writer).
+            last_draw: entry.draw_score,
         }
     }
 
@@ -43,16 +46,17 @@ impl PackedMoveScoreListReader {
     // Get the next TrainingDataEntry from the movetext
     pub fn next_entry(&mut self, movetext: &[u8]) -> TrainingDataEntry {
         self.entry.pos.do_move(self.entry.mv);
-        let (mv, score) = self.next_move_score(movetext);
+        let (mv, score, draw_score) = self.next_move_score(movetext);
         self.entry.mv = mv;
         self.entry.score = score;
+        self.entry.draw_score = draw_score;
         self.entry.ply += 1;
         self.entry.result = -self.entry.result;
         self.entry
     }
 
-    // Read a move and score from the movetext
-    pub fn next_move_score(&mut self, movetext: &[u8]) -> (Move, i16) {
+    // Read a move, score and draw score from the movetext
+    pub fn next_move_score(&mut self, movetext: &[u8]) -> (Move, i16, i16) {
         // if !self.has_next() {
         //     return Ok(None);
         // }
@@ -73,12 +77,16 @@ impl PackedMoveScoreListReader {
 
         // Extract the score
         let score = self.decode_score(movetext);
-
         self.last_score = -score;
+
+        // Extract the draw score (read in the same order the writer wrote it;
+        // no sign flip — see writer add_move_score).
+        let draw_score = self.decode_draw(movetext);
+        self.last_draw = draw_score;
 
         self.num_read_plies += 1;
 
-        (move_, score)
+        (move_, score, draw_score)
     }
 
     // EBNF: EncodedMove
@@ -87,6 +95,13 @@ impl PackedMoveScoreListReader {
         let delta = unsigned_to_signed(self.reader.extract_vle16(movetext, SCORE_VLE_BLOCK_SIZE));
 
         self.last_score.wrapping_add(delta)
+    }
+
+    fn decode_draw(&mut self, movetext: &[u8]) -> i16 {
+        const SCORE_VLE_BLOCK_SIZE: usize = 4;
+        let delta = unsigned_to_signed(self.reader.extract_vle16(movetext, SCORE_VLE_BLOCK_SIZE));
+
+        self.last_draw.wrapping_add(delta)
     }
 
     // EBNF: EncodedScore

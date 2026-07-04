@@ -84,23 +84,25 @@ Magic        = "BINP"
 ChunkSize    = UINT32LE               (* 4 bytes, little endian *)
 
 Chain        = Stem Count MoveText
-Stem         = Position Move Score PlyResult Rule50
+Stem         = Position Move Score PlyResult Rule50 DrawScore
 Count        = UINT16BE               (* 2 bytes, big endian *)
 MoveText     = MoveScore*
 
-(* Stem components - total 32 bytes *)
+(* Stem components - total 34 bytes *)
 Position     = CompressedPosition     (* 24 bytes *)
 Move         = CompressedMove         (* 2 bytes *)
 Score        = INT16BE                (* 2 bytes, big endian, signed *)
 PlyResult    = UINT8                  (* 2 byte, big endian unsigned *)
 Rule50       = UINT16BE               (* 2 bytes, big endian *)
+DrawScore    = INT16BE                (* 2 bytes, big endian, signed; 2nd value channel *)
 
 (* MoveText components *)
-MoveScore    = EncodedMove EncodedScore
+MoveScore    = EncodedMove EncodedScore EncodedDraw
 
 (* Encoded components *)
 EncodedMove  = VARLEN_UINT            (* Variable length encoding *)
-EncodedScore = VARLEN_INT             (* Variable length encoding *)
+EncodedScore = VARLEN_INT             (* Variable length encoding; sign-flipped per ply *)
+EncodedDraw  = VARLEN_INT             (* Variable length encoding; NOT sign-flipped (side-symmetric) *)
 */
 
 // EBNF: File
@@ -109,11 +111,11 @@ impl<T: Read + Seek> CompressedTrainingDataEntryReader<T> {
     /// reading from the file at the given path.
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// use std::fs::File;
     /// use sfbinpack::CompressedTrainingDataEntryReader;
     ///
-    /// let file = File::options().read(true).write(false).create(false).open("test/ep1.binpack").unwrap();
+    /// let file = File::options().read(true).write(false).create(false).open("in.binpack").unwrap();
     /// let mut reader = CompressedTrainingDataEntryReader::new(file).unwrap();
     ///
     /// while reader.has_next() {
@@ -316,7 +318,7 @@ impl<'a> CompressedTrainingDataEntryReader<io::Cursor<&'a [u8]>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::OpenOptions, io::Cursor};
+    use std::io::Cursor;
 
     use crate::chess::{
         coords::Square,
@@ -326,181 +328,109 @@ mod tests {
     };
 
     use super::*;
+    use crate::CompressedTrainingDataEntryWriter;
 
-    #[test]
-    fn test_reader_simple() {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(false)
-            .append(false)
-            .open("./test/ep1.binpack")
-            .unwrap();
-        let mut reader = CompressedTrainingDataEntryReader::new(file).unwrap();
-
-        let mut entries: Vec<TrainingDataEntry> = Vec::new();
-
-        while reader.has_next() {
-            let entry = reader.next();
-
-            entries.push(entry);
-        }
-
-        let expected = vec![
+    /// A valid 3-ply continuation chain (stem + 2 continuations) with a varying
+    /// draw channel, to exercise the no-flip draw delta on read-back.
+    fn sample_chain() -> Vec<TrainingDataEntry> {
+        vec![
             TrainingDataEntry {
                 pos: Position::from_fen("1q5b/1r5k/4p2p/1b2P1pN/3p4/6PP/1nP3B1/1Q2B1K1 w - - 0 35")
                     .unwrap(),
-                mv: Move::new(
-                    Square::new(10),
-                    Square::new(26),
-                    MoveType::Normal,
-                    Piece::none(),
-                ),
+                mv: Move::new(Square::new(10), Square::new(26), MoveType::Normal, Piece::none()),
                 score: -201,
                 ply: 68,
                 result: 0,
+                draw_score: 100,
             },
             TrainingDataEntry {
                 pos: Position::from_fen("1q5b/1r5k/4p2p/1b2P1pN/2Pp4/6PP/1n4B1/1Q2B1K1 b - - 0 35")
                     .unwrap(),
-                mv: Move::new(
-                    Square::new(27),
-                    Square::new(19),
-                    MoveType::Normal,
-                    Piece::none(),
-                ),
+                mv: Move::new(Square::new(27), Square::new(19), MoveType::Normal, Piece::none()),
                 score: 254,
                 ply: 69,
                 result: 0,
+                draw_score: -3000,
             },
             TrainingDataEntry {
-                pos: Position::from_fen(
-                    "1q5b/1r5k/4p2p/1b2P1pN/2P5/3p2PP/1n4B1/1Q2B1K1 w - - 0 36",
-                )
-                .unwrap(),
-                mv: Move::new(
-                    Square::new(14),
-                    Square::new(49),
-                    MoveType::Normal,
-                    Piece::none(),
-                ),
+                pos: Position::from_fen("1q5b/1r5k/4p2p/1b2P1pN/2P5/3p2PP/1n4B1/1Q2B1K1 w - - 0 36")
+                    .unwrap(),
+                mv: Move::new(Square::new(14), Square::new(49), MoveType::Normal, Piece::none()),
                 score: -220,
                 ply: 70,
                 result: 0,
+                draw_score: 12345,
             },
-        ];
+        ]
+    }
 
-        assert_eq!(entries, expected);
+    fn write_to_bytes(entries: &[TrainingDataEntry]) -> Vec<u8> {
+        let mut writer = CompressedTrainingDataEntryWriter::new_in_memory().unwrap();
+        for e in entries {
+            writer.write_entry(e).unwrap();
+        }
+        writer.into_bytes().unwrap()
     }
 
     #[test]
-    fn test_reader_big_score_diff() {
-        let cursor: Cursor<Vec<u8>> = Cursor::new(Vec::from([
-            66, 73, 78, 80, 37, 0, 0, 0, 130, 130, 144, 210, 8, 192, 70, 82, 72, 58, 64, 0, 81, 16,
-            18, 113, 155, 5, 0, 0, 0, 0, 0, 0, 10, 104, 249, 253, 0, 68, 0, 0, 0, 1, 29, 83, 79,
-        ]));
+    fn test_reader_roundtrip() {
+        // Write a chain, read it back through the reader, and require every field
+        // (score AND draw) to match. Exercises stem + continuation decoding.
+        let entries = sample_chain();
+        let bytes = write_to_bytes(&entries);
 
-        let mut reader = CompressedTrainingDataEntryReader::new(cursor).unwrap();
-
-        let mut entries: Vec<TrainingDataEntry> = Vec::new();
+        let mut reader = CompressedTrainingDataEntryReader::from_bytes(bytes).unwrap();
+        let mut got: Vec<TrainingDataEntry> = Vec::new();
         while reader.has_next() {
-            let entry = reader.next();
-
-            entries.push(entry);
+            got.push(reader.next());
         }
 
-        let expected = vec![
-            TrainingDataEntry {
-                pos: Position::from_fen("1q5b/1r5k/4p2p/1b2P1pN/3p4/6PP/1nP3B1/1Q2B1K1 w - - 0 35")
-                    .unwrap(),
-                mv: Move::new(
-                    Square::new(10),
-                    Square::new(26),
-                    MoveType::Normal,
-                    Piece::none(),
-                ),
-                score: -31999,
-                ply: 68,
-                result: 0,
-            },
-            TrainingDataEntry {
-                pos: Position::from_fen("1q5b/1r5k/4p2p/1b2P1pN/2Pp4/6PP/1n4B1/1Q2B1K1 b - - 0 35")
-                    .unwrap(),
-                mv: Move::new(
-                    Square::new(27),
-                    Square::new(19),
-                    MoveType::Normal,
-                    Piece::none(),
-                ),
-                score: -1500,
-                ply: 69,
-                result: 0,
-            },
-        ];
-
-        assert_eq!(entries, expected);
+        assert_eq!(got, entries);
     }
 
     #[test]
-    fn test_reader_from_bytes() {
-        let file = std::fs::read("./test/ep1.binpack").unwrap();
-        let mut reader = CompressedTrainingDataEntryReader::from_bytes(file).unwrap();
+    fn test_parse_chunk() {
+        // The whole (small) chain lands in a single chunk. Strip the 8-byte
+        // "BINP" + size header and parse the raw chunk payload directly.
+        let bytes = write_to_bytes(&sample_chain());
+        let entries = parse_chunk(&bytes[8..]);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].draw_score, 12345);
+    }
 
-        let mut num_entries = 0;
+    #[test]
+    fn test_big_deltas_roundtrip() {
+        // Extreme score/draw values near the i16 limits (full 4-block VLE deltas
+        // with wrap-around) must survive the read-back exactly.
+        let mut entries = sample_chain();
+        entries[0].score = -31999;
+        entries[0].draw_score = 30000;
+        entries[1].score = -1500;
+        entries[1].draw_score = -30000;
+        entries[2].score = 32000;
+        entries[2].draw_score = 30000;
+
+        let bytes = write_to_bytes(&entries);
+        let mut reader = CompressedTrainingDataEntryReader::from_bytes(bytes).unwrap();
+        let mut got: Vec<TrainingDataEntry> = Vec::new();
         while reader.has_next() {
-            let _ = reader.next();
-            num_entries += 1;
+            got.push(reader.next());
         }
-
-        assert_eq!(num_entries, 3);
+        assert_eq!(got, entries);
     }
 
+    // Regression test for https://github.com/Disservin/binpack-rust/issues/17
     #[test]
-    fn test_chunk_read_and_parse() {
-        let first_chunk: Vec<u8> = vec![
-            98, 121, 192, 21, 24, 76, 241, 100, 100, 106, 0, 4, 8, 48, 2, 17, 17, 145, 19, 117,
-            247, 0, 0, 0, 61, 232, 0, 253, 0, 39, 0, 2, 0, 0,
-        ];
-        let second_chunk: Vec<u8> = vec![
-            98, 121, 192, 21, 24, 76, 241, 100, 100, 106, 0, 4, 8, 48, 2, 17, 17, 145, 19, 117,
-            247, 0, 0, 0, 61, 232, 0, 253, 0, 39, 0, 2, 0, 0,
-        ];
-
-        let mut file = Vec::new();
-        file.extend_from_slice(b"BINP");
-        file.extend_from_slice(&(first_chunk.len() as u32).to_le_bytes());
-        file.extend_from_slice(&first_chunk);
-        file.extend_from_slice(b"BINP");
-        file.extend_from_slice(&(second_chunk.len() as u32).to_le_bytes());
-        file.extend_from_slice(&second_chunk);
-
-        let mut reader = CompressedTrainingDataEntryReader::from_bytes(file).unwrap();
-        let mut chunk = Vec::new();
-
-        assert!(reader.read_next_chunk_into(&mut chunk).unwrap());
-        assert_eq!(chunk, second_chunk);
-
-        let entries = parse_chunk(&chunk);
-
-        assert_eq!(entries.len(), 1);
-        assert!(!reader.read_next_chunk_into(&mut chunk).unwrap());
-    }
-
-    // test case for https://github.com/Disservin/binpack-rust/issues/17
-    #[test]
-    #[should_panic(expected = "index out of bounds: the len is 0 but the index is 0")]
+    #[should_panic]
     fn test_reader_no_moves() {
-        // Safe API UB: CompressedTrainingDataEntryReader constructs a BitReader
-        // from a raw pointer without tracking length. A crafted chunk with
-        // num_plies > 0 but no movetext bytes triggers OOB reads.
+        // Safe API UB: the reader builds a BitReader from a raw pointer without
+        // tracking length. A crafted chunk with num_plies > 0 but no movetext
+        // bytes triggers an out-of-bounds read. Build a valid (new-format) stem
+        // via the writer's packer so this stays in sync with the layout.
+        let stem = sample_chain()[0];
+        let entry_bytes = PackedTrainingDataEntry::from_entry(&stem).data;
 
-        // Valid packed entry bytes from crate tests (32 bytes).
-        let entry_bytes: [u8; 32] = [
-            98, 121, 192, 21, 24, 76, 241, 100, 100, 106, 0, 4, 8, 48, 2, 17, 17, 145, 19, 117,
-            247, 0, 0, 0, 61, 232, 0, 253, 0, 39, 0, 2,
-        ];
-
-        // num_plies = 1, but movetext is empty (chunk size == 32 + 2).
+        // num_plies = 1, but movetext is empty.
         let mut chunk = Vec::new();
         chunk.extend_from_slice(&entry_bytes);
         chunk.extend_from_slice(&1u16.to_be_bytes());

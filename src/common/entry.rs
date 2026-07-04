@@ -22,6 +22,12 @@ pub struct TrainingDataEntry {
     /// The game result of the position.
     /// 1, 0, -1 for win, draw, loss for the side to move (like with score).
     pub result: i16,
+    /// A second stm-relative value channel (intended for a draw score), using
+    /// the same i16 encoding as `score`. Unlike `score`, the delta encoder
+    /// treats this as side-symmetric — it is NOT sign-flipped between plies —
+    /// so a value that is invariant under side-to-move (e.g. a draw
+    /// probability) encodes as a ~0 delta. See writer `add_move_score`.
+    pub draw_score: i16,
 }
 
 impl TrainingDataEntry {
@@ -36,19 +42,28 @@ impl fmt::Display for TrainingDataEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} {} {} {} {}",
+            "{} {} {} {} {} {}",
             self.pos.fen().unwrap(),
             self.mv.as_uci(),
             self.score,
             self.ply,
-            self.result
+            self.result,
+            self.draw_score
         )
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct PackedTrainingDataEntry {
-    pub data: [u8; 32],
+    // 32 bytes of the Stockfish stem layout + 2 bytes for the draw-score channel.
+    pub data: [u8; 34],
+}
+
+impl Default for PackedTrainingDataEntry {
+    fn default() -> Self {
+        // [u8; N] only derives Default for N <= 32, so implement it by hand.
+        Self { data: [0u8; 34] }
+    }
 }
 
 /// A packed training data entry.
@@ -96,6 +111,10 @@ impl PackedTrainingDataEntry {
         // Read and set rule50 counter
         // EBNF: Rule50
         pos.set_rule50_counter(self.read_u16_be(offset));
+        offset += 2;
+
+        // Read draw score (second value channel)
+        let draw_score = unsigned_to_signed(self.read_u16_be(offset));
 
         TrainingDataEntry {
             pos,
@@ -103,6 +122,7 @@ impl PackedTrainingDataEntry {
             score,
             ply,
             result,
+            draw_score,
         }
     }
 
@@ -137,6 +157,12 @@ impl PackedTrainingDataEntry {
         packed.data[offset] = (entry.pos.rule50_counter() >> 8) as u8;
         offset += 1;
         packed.data[offset] = entry.pos.rule50_counter() as u8;
+        offset += 1;
+
+        // Pack draw score (second value channel)
+        packed.data[offset] = (signed_to_unsigned(entry.draw_score) >> 8) as u8;
+        offset += 1;
+        packed.data[offset] = signed_to_unsigned(entry.draw_score) as u8;
 
         packed
     }
@@ -153,17 +179,9 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_packed_training_data_entry() {
-        let data = [
-            98, 121, 192, 21, 24, 76, 241, 100, 100, 106, 0, 4, 8, 48, 2, 17, 17, 145, 19, 117,
-            247, 0, 0, 0, 61, 232, 0, 253, 0, 39, 0, 2,
-        ];
-
-        let packed_entry = PackedTrainingDataEntry::from_slice(&data);
-
-        let entry = packed_entry.unpack_entry();
-
-        let expected = TrainingDataEntry {
+    fn test_packed_entry_roundtrip() {
+        // Full stem pack -> unpack round-trip, including the draw-score channel.
+        let entry = TrainingDataEntry {
             pos: Position::from_fen(
                 "1r3rk1/p2qnpb1/6pp/P1p1p3/3nN3/2QP2P1/R3PPBP/2B2RK1 b - - 2 20",
             )
@@ -177,13 +195,19 @@ mod test {
             score: -127,
             ply: 39,
             result: 0,
+            draw_score: 12345,
         };
 
-        assert_eq!(entry, expected);
+        let packed = PackedTrainingDataEntry::from_entry(&entry);
+        let unpacked = packed.unpack_entry();
+
+        assert_eq!(unpacked, entry);
+        assert_eq!(unpacked.draw_score, 12345);
     }
 
     #[test]
     fn test_size_of_packed_training_data_entry() {
-        assert_eq!(PackedTrainingDataEntry::byte_size(), 32);
+        // 32 bytes of Stockfish stem layout + 2 bytes for the draw-score channel.
+        assert_eq!(PackedTrainingDataEntry::byte_size(), 34);
     }
 }
